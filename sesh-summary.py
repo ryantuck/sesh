@@ -536,22 +536,97 @@ def compute_session_stats(events, subagent_dir=None):
     return stats
 
 
-def generate_summary(session_path):
-    """Generate the full markdown summary for a session."""
-    session_path = Path(session_path)
+def resolve_project_dir(project_name):
+    """Resolve a project name to the ~/.claude/projects/PROJECT_NAME/ directory.
 
-    # Determine the JSONL file and session directory
-    if session_path.suffix == ".jsonl":
-        jsonl_path = session_path
-        session_id = session_path.stem
-        session_dir = session_path.parent / session_id
-    elif session_path.is_dir():
-        session_id = session_path.name
-        jsonl_path = session_path.parent / f"{session_id}.jsonl"
-        session_dir = session_path
-    else:
-        print(f"Error: {session_path} is not a .jsonl file or directory", file=sys.stderr)
+    Accepts either:
+      - An encoded project name (e.g. "-home-ryan-sesh")
+      - A real path (e.g. "/home/ryan/sesh" or "~/sesh") which gets encoded
+    """
+    base = Path.home() / ".claude" / "projects"
+
+    # If it looks like an encoded project name, use directly
+    candidate = base / project_name
+    if candidate.is_dir() and base in candidate.parents:
+        return candidate
+
+    # Otherwise, treat as a real path and encode it
+    real = Path(os.path.expanduser(project_name)).resolve()
+    encoded = str(real).replace("/", "-")
+    candidate = base / encoded
+    if candidate.is_dir():
+        return candidate
+
+    return None
+
+
+def list_projects():
+    """List all available projects under ~/.claude/projects/."""
+    base = Path.home() / ".claude" / "projects"
+    if not base.is_dir():
+        print("No projects found at ~/.claude/projects/", file=sys.stderr)
         sys.exit(1)
+
+    projects = sorted(p.name for p in base.iterdir() if p.is_dir() and p.name != "memory")
+    if not projects:
+        print("No projects found.", file=sys.stderr)
+        sys.exit(1)
+
+    print("Available projects:\n", file=sys.stderr)
+    for p in projects:
+        # Count sessions
+        session_count = len(list(Path(base / p).glob("*.jsonl")))
+        print(f"  {p}  ({session_count} sessions)", file=sys.stderr)
+    sys.exit(0)
+
+
+def list_sessions(project_dir):
+    """List all sessions (JSONL files) in a project directory."""
+    sessions = sorted(project_dir.glob("*.jsonl"))
+    if not sessions:
+        print(f"No sessions found in {project_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Sessions in {project_dir.name}:\n", file=sys.stderr)
+    for s in sessions:
+        uuid = s.stem
+        # Peek at first few events for timestamp and initial prompt
+        ts = "unknown"
+        prompt_preview = ""
+        try:
+            with open(s) as f:
+                for raw_line in f:
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    evt = json.loads(raw_line)
+                    # Grab timestamp from any event that has one
+                    if ts == "unknown":
+                        t = evt.get("timestamp") or (evt.get("snapshot", {}) or {}).get("timestamp")
+                        if t:
+                            ts = format_timestamp(t)
+                    # Grab first user prompt as preview
+                    if evt.get("type") == "user" and not prompt_preview:
+                        content = evt.get("message", {}).get("content")
+                        if isinstance(content, str) and content:
+                            prompt_preview = content[:80].replace("\n", " ")
+                            if len(content) > 80:
+                                prompt_preview += "..."
+                    if ts != "unknown" and prompt_preview:
+                        break
+        except (json.JSONDecodeError, OSError):
+            pass
+        line = f"  {uuid}  ({ts})"
+        if prompt_preview:
+            line += f"\n    {prompt_preview}"
+        print(line, file=sys.stderr)
+    sys.exit(0)
+
+
+def generate_summary(project_dir, session_id):
+    """Generate the full markdown summary for a session."""
+    jsonl_path = project_dir / f"{session_id}.jsonl"
+    session_dir = project_dir / session_id
 
     if not jsonl_path.exists():
         print(f"Error: {jsonl_path} not found", file=sys.stderr)
@@ -673,20 +748,27 @@ def generate_summary(session_path):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: sesh-summary.py <session.jsonl | session-dir>", file=sys.stderr)
-        print("", file=sys.stderr)
-        print("Generate a markdown summary of a Claude Code session.", file=sys.stderr)
-        print("", file=sys.stderr)
-        print("Arguments:", file=sys.stderr)
-        print("  session.jsonl    Path to the main session JSONL file", file=sys.stderr)
-        print("  session-dir      Path to the session directory", file=sys.stderr)
-        print("", file=sys.stderr)
-        print("Output is written to stdout. Redirect to a file as needed:", file=sys.stderr)
-        print("  sesh-summary.py session.jsonl > summary.md", file=sys.stderr)
+        # No args: list available projects
+        list_projects()
+
+    project_name = sys.argv[1]
+    project_dir = resolve_project_dir(project_name)
+    if project_dir is None:
+        print(f"Error: project '{project_name}' not found under ~/.claude/projects/", file=sys.stderr)
+        print("Run with no arguments to list available projects.", file=sys.stderr)
         sys.exit(1)
 
-    session_path = sys.argv[1]
-    summary = generate_summary(session_path)
+    if len(sys.argv) < 3:
+        # Project given but no UUID: list sessions
+        list_sessions(project_dir)
+
+    session_id = sys.argv[2]
+
+    # Allow passing UUID with or without .jsonl suffix
+    if session_id.endswith(".jsonl"):
+        session_id = session_id[:-6]
+
+    summary = generate_summary(project_dir, session_id)
     print(summary)
 
 
